@@ -1,11 +1,11 @@
 # 로또 프로그램 시스템 아키텍처 설계서 (SAD)
 ## System Architecture Design for Lotto Program
 
-**문서 버전**: 1.1  
+**문서 버전**: 1.2  
 **작성일**: 2025년 9월 20일  
 **최종 수정일**: 2025년 9월 20일  
 **프로젝트명**: QT/QML 기반 로또 프로그램  
-**참조 문서**: CuRS v1.1, SyRS v1.1
+**참조 문서**: CuRS v1.2, SyRS v1.1
 
 ---
 
@@ -15,6 +15,7 @@
 |------|------|-----------|--------|
 | 1.0 | 2025-09-20 | 초기 문서 작성 | 개발팀 |
 | 1.1 | 2025-09-20 | 적중률 분석 기능 아키텍처 반영, GUI/Backend 컴포넌트 확장, 데이터베이스 스키마 확장 | 개발팀 |
+| 1.2 | 2025-09-20 | DB 스키마 동기화, IPC 통신 방식 및 플러그인 인터페이스 명세 구체화 | Gemini |
 
 ---
 
@@ -294,13 +295,15 @@ public:
 │                               └─────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 
+로컬 통신 시에는 TCP/IP 소켓의 오버헤드를 줄이고 더 높은 성능을 제공하는 `QLocalSocket`(Windows의 경우 Named Pipe, Unix 계열의 경우 Unix Domain Socket 기반)을 우선적으로 사용합니다. 원격 통신 시에는 `TCP/IP Socket`을 사용합니다.
+
 프로토콜 스택:
 ┌──────────────────┐
 │ Application Data │  ← QVariant, JSON
 ├──────────────────┤
 │ Qt Remote Objects│  ← Object Serialization
 ├──────────────────┤
-│ TCP/IP Socket    │  ← Network Transport
+│ QLocalSocket/TCP │  ← Local(Named Pipe) / Remote
 ├──────────────────┤
 │ Operating System │  ← Windows IPC
 └──────────────────┘
@@ -384,101 +387,122 @@ class ExternalAPIArchitecture {
 
 ### 6.2 데이터베이스 스키마 개요
 ```sql
--- 메인 데이터베이스 테이블들
-CREATE TABLE generated_numbers (
+-- 통합 데이터베이스 스키마 (SyRS v1.1 기준)
+
+-- `WinningNumbers` (실제 당첨 번호)
+CREATE TABLE WinningNumbers (
+    draw_number INTEGER PRIMARY KEY,      -- 회차
+    draw_date TEXT,                       -- 추첨일 (YYYY-MM-DD)
+    winning_numbers TEXT,                 -- 당첨 번호 6개 (JSON 배열)
+    bonus_number INTEGER,                 -- 보너스 번호
+    prize_amounts TEXT,                   -- 등수별 당첨금 정보 (JSON 객체)
+    cached_at TEXT                        -- 데이터 캐시 시각 (ISO 8601)
+);
+
+-- `UserTickets` (사용자 생성 번호)
+CREATE TABLE UserTickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER DEFAULT 1,      -- 사용자 식별자 (추후 멀티유저 대비)
-    numbers TEXT NOT NULL,           -- JSON array [1,2,3,4,5,6]
-    rules_applied TEXT,              -- JSON array of rule names
-    generation_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-    user_notes TEXT,
-    -- 적중 결과 필드들 (당첨번호 발표 후 업데이트)
-    draw_number INTEGER,             -- 해당 회차 번호
-    match_count INTEGER DEFAULT -1,  -- 적중 개수 (-1: 미확인)
-    rank INTEGER DEFAULT 0,          -- 등수 (0: 당첨없음)
-    bonus_match BOOLEAN DEFAULT 0,   -- 보너스 번호 적중 여부
-    winning_amount REAL DEFAULT 0,   -- 당첨금액
-    result_updated_at DATETIME       -- 결과 업데이트 시간
+    user_id INTEGER DEFAULT 1,            -- 사용자 식별자 (향후 다중 사용자 지원 대비)
+    numbers TEXT,                         -- 생성된 번호 6개 (JSON 배열)
+    rules_applied TEXT,                   -- 적용된 규칙 상세 정보 (JSON)
+    generation_time TEXT,                 -- 생성 시각 (ISO 8601)
+    draw_number INTEGER,                  -- 분석 대상 회차
+    match_count INTEGER DEFAULT -1,       -- 일치 번호 개수 (-1: 미확인)
+    rank INTEGER DEFAULT 0,               -- 당첨 등수 (0: 낙첨)
+    bonus_match INTEGER DEFAULT 0,        -- 보너스 번호 일치 여부 (0: 불일치, 1: 일치)
+    winning_amount REAL DEFAULT 0,        -- 가상 당첨금
+    result_updated_at TEXT                -- 당첨 결과 업데이트 시각 (ISO 8601)
 );
 
--- 적중률 분석 캐시 테이블
-CREATE TABLE user_hit_statistics (
-    user_id INTEGER PRIMARY KEY,
-    total_generations INTEGER DEFAULT 0,
-    total_hits INTEGER DEFAULT 0,
-    hit_rate REAL DEFAULT 0.0,
-    total_investment REAL DEFAULT 0.0,
-    total_winnings REAL DEFAULT 0.0,
-    net_profit REAL DEFAULT 0.0,
-    roi REAL DEFAULT 0.0,
-    hit_distribution TEXT,           -- JSON: {0:count, 1:count, ...}
-    rank_distribution TEXT,          -- JSON: {1:count, 2:count, ...}
-    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+-- `GenerationRules` (사용자 정의 규칙)
+CREATE TABLE GenerationRules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,            -- 규칙 이름
+    description TEXT,                     -- 규칙 설명
+    rule_config TEXT,                     -- 규칙 상세 설정 (JSON)
+    created_at TEXT,                      -- 생성 시각 (ISO 8601)
+    usage_count INTEGER DEFAULT 0         -- 사용 횟수
 );
 
--- 번호별 성과 추적
-CREATE TABLE number_performance (
-    user_id INTEGER,
-    number INTEGER,
-    usage_count INTEGER DEFAULT 0,
-    hit_count INTEGER DEFAULT 0,
-    hit_rate REAL DEFAULT 0.0,
-    last_hit_date DATETIME,
-    PRIMARY KEY (user_id, number)
+-- `ScheduledTasks` (예약 작업)
+CREATE TABLE ScheduledTasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,                   -- 작업 이름
+    task_type TEXT,                       -- 작업 종류 ('number_generation', 'email_send' 등)
+    schedule_config TEXT,                 -- 실행 주기 설정 (JSON, cron 표현식 등)
+    rule_config TEXT,                     -- 적용할 규칙 설정 (JSON)
+    recipients TEXT,                      -- 수신자 이메일 목록 (JSON 배열)
+    is_active INTEGER DEFAULT 1,          -- 활성화 여부 (0 또는 1)
+    next_execution TEXT,                  -- 다음 실행 예정 시각 (ISO 8601)
+    last_execution TEXT                   -- 마지막 실행 시각 (ISO 8601)
 );
 
--- 규칙별 성과 추적
-CREATE TABLE rule_performance (
+-- `RulePerformance` (규칙별 성과)
+CREATE TABLE RulePerformance (
     user_id INTEGER,
     rule_name TEXT,
-    usage_count INTEGER DEFAULT 0,
-    total_hits INTEGER DEFAULT 0,
-    hit_rate REAL DEFAULT 0.0,
-    average_rank REAL DEFAULT 0.0,
-    roi REAL DEFAULT 0.0,
-    last_used DATETIME,
-    rank_distribution TEXT,          -- JSON: {1:count, 2:count, ...}
+    usage_count INTEGER DEFAULT 0,        -- 사용 횟수
+    total_hits INTEGER DEFAULT 0,         -- 총 적중 횟수 (예: 3개 이상 일치)
+    hit_rate REAL DEFAULT 0.0,            -- 적중률
+    roi REAL DEFAULT 0.0,                 -- 투자 수익률
+    rank_distribution TEXT,               -- 등수별 당첨 분포 (JSON)
+    last_used TEXT,                       -- 마지막 사용 시각 (ISO 8601)
     PRIMARY KEY (user_id, rule_name)
 );
 
-CREATE TABLE custom_rules (
+-- `NumberPerformance` (번호별 성과)
+CREATE TABLE NumberPerformance (
+    user_id INTEGER,
+    number INTEGER,
+    usage_count INTEGER DEFAULT 0,        -- 생성 시 포함된 횟수
+    hit_count INTEGER DEFAULT 0,          -- 당첨 번호로 적중한 횟수
+    hit_rate REAL DEFAULT 0.0,            -- 적중률
+    last_hit_date TEXT,                   -- 마지막으로 적중된 날짜 (ISO 8601)
+    PRIMARY KEY (user_id, number)
+);
+
+-- `UserHitStatistics` (사용자 종합 통계)
+CREATE TABLE UserHitStatistics (
+    user_id INTEGER PRIMARY KEY,
+    total_generations INTEGER DEFAULT 0,  -- 총 생성 게임 수
+    total_investment REAL DEFAULT 0.0,    -- 총 투자 비용
+    total_winnings REAL DEFAULT 0.0,      -- 총 당첨금
+    net_profit REAL DEFAULT 0.0,          -- 순수익
+    roi REAL DEFAULT 0.0,                 -- 투자 수익률
+    hit_distribution TEXT,                -- 적중 개수별 분포 (JSON, 예: `{"3": 10, "4": 2}`)
+    rank_distribution TEXT,               -- 등수별 분포 (JSON, 예: `{"1": 0, "5": 5}`)
+    last_updated TEXT                     -- 마지막 업데이트 시각 (ISO 8601)
+);
+
+-- `SystemLogs` (시스템 로그)
+CREATE TABLE SystemLogs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    description TEXT,
-    rule_config TEXT,               -- JSON configuration
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    usage_count INTEGER DEFAULT 0
+    timestamp TEXT,                       -- 로그 생성 시각 (ISO 8601)
+    level TEXT,                           -- 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    category TEXT,                        -- 로그 카테고리 (UI, Database, Network 등)
+    message TEXT,                         -- 로그 메시지
+    thread_id TEXT,                       -- 스레드 식별자
+    performance_data TEXT                 -- 성능 관련 데이터 (JSON, NULLABLE)
 );
 
-CREATE TABLE lottery_results (
-    draw_number INTEGER PRIMARY KEY,
-    winning_numbers TEXT NOT NULL,  -- JSON array
-    bonus_number INTEGER,
-    draw_date DATE,
-    prize_amounts TEXT,             -- JSON object {1st:..., 2nd:...}
-    cached_at DATETIME DEFAULT CURRENT_TIMESTAMP
+-- `UserSettings` (사용자 설정)
+CREATE TABLE UserSettings (
+    category TEXT,
+    key TEXT,                             -- 설정 키
+    value TEXT,                           -- 설정 값 (JSON 형식 권장)
+    is_encrypted INTEGER DEFAULT 0,       -- 암호화 여부 (0 또는 1)
+    modified_at TEXT,                     -- 마지막 수정 시각 (ISO 8601)
+    PRIMARY KEY (category, key)
 );
 
-CREATE TABLE email_history (
+-- `EmailHistory` (이메일 발송 내역)
+CREATE TABLE EmailHistory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient TEXT NOT NULL,
     subject TEXT,
-    content TEXT,
-    attachment_path TEXT,
-    sent_at DATETIME,
-    status TEXT,                    -- 'pending', 'sent', 'failed'
-    error_message TEXT
-);
-
-CREATE TABLE scheduled_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    task_type TEXT,                 -- 'number_generation', 'email_send'
-    schedule_config TEXT,           -- JSON cron-like config
-    rule_config TEXT,               -- JSON rules to apply
-    next_execution DATETIME,
-    last_execution DATETIME,
-    is_active BOOLEAN DEFAULT 1
+    sent_at TEXT,                         -- 발송 시각 (ISO 8601)
+    status TEXT,                          -- 상태 ('sent', 'failed')
+    error_message TEXT                    -- 오류 메시지 (실패 시)
 );
 ```
 
@@ -632,7 +656,17 @@ public:
     virtual QString getRuleDescription() const = 0;
     
     // 성능 메트릭
+    /**
+     * @brief 이 규칙의 예상 성능 지표를 반환합니다. (예: 예상 적중률, 실행 시간 등)
+     * @return 0.0 ~ 1.0 사이의 예상 적중률 또는 기타 성능 지표.
+     */
     virtual double getExpectedPerformance() const = 0;
+
+    /**
+     * @brief 이 규칙의 과거 통계 데이터를 반환합니다.
+     * @return QVariantMap 형태의 통계 데이터.
+     *         예: {"averageRank": 3.5, "hitCount": 15, "usageCount": 100}
+     */
     virtual QVariantMap getStatistics() const = 0;
 };
 ```
