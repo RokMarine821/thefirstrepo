@@ -29,6 +29,7 @@
     *   **프론트엔드 (UI Application)**: Python/PyQt로 구현되며, 사용자 인터페이스, 사용자 입력 처리, AI 연동 및 결과 시각화를 담당한다.
     *   **백엔드 (Core Engine)**: C++로 구현되며, 핵심 비즈니스 로직(DLT 로그 파싱, 규칙 적용)을 담당하는 Headless 서비스로 동작한다.
 *   **통신 방식**: 로컬 IPC(Inter-Process Communication)를 사용하여 프론트엔드와 백엔드 간의 통신을 구현한다. 데이터 교환 형식은 JSON-RPC를 사용한다.
+    *   **세부 구현**: 프론트엔드 프로세스가 백엔드 프로세스를 자식으로 실행하고, **표준 입출력(Standard I/O) 스트림**을 통해 통신한다. 이는 플랫폼 독립적이며 구현이 간단하다. 백엔드는 `stdout`으로 응답을 보내고, 프론트엔드는 `stdin`으로 요청을 보낸다.
 *   **플러그인 아키텍처**: 기능 확장을 위해 플러그인 시스템을 도입한다. (FR-10)
 
 ### 2.2 기술 스택
@@ -56,6 +57,51 @@
 
 ## 3. 시스템 기능 명세 (System Functional Specification)
 
+### 3.1 3단계 분석 프로세스 다이어그램
+
+```mermaid
+graph TD
+    subgraph "사용자 영역 (UI Application - Python/PyQt)"
+        A["1. DLT 로그 파일 입력<br/>(Drag & Drop)"] --> B{"2. 분석 요청"};
+        B --> C["3. 로그 처리 요청<br/>(파일 경로 전달)"];
+        
+        subgraph "규칙 관리자 (FR-03.1)"
+            U1["규칙 생성/편집 UI"] --> U2{"규칙 저장"};
+            U2 -- YAML/JSON --> R["규칙 파일"];
+        end
+
+        I["10. 필터링된 로그 표시<br/>(UI 업데이트)"] --> J{"11. 심층 분석 요청<br/>(자연어 질문)"};
+        J --> K["12. AI 프롬프트 생성<br/>(로그 스니펫 + 질문)"];
+        K --> L["13. AI API 호출<br/>(Google/OpenAI)"];
+        M["14. AI 응답 수신 및 파싱"] --> N["15. 분석 결과 및 해결책 제시<br/>(대화형 UI에 표시)"];
+        N --> O["16. 리포트 생성/세션 저장<br/>(CSV, PDF, .dlt_session)"];
+    end
+
+    subgraph "백엔드 영역 (Core Engine - C++)"
+        D["4. 로그 파싱<br/>(LogParserModule)"];
+        E["5. 구조화된 데이터로 변환<br/>(JSON Stream)"];
+        R -.-> F{"6. 규칙 적용<br/>(RuleEngineModule)"};
+        F --> G["7. 로그 필터링/그룹화"];
+        G --> H["8. 결과 반환<br/>(필터링된 로그 인덱스)"];
+    end
+
+    subgraph "외부 시스템"
+        X["AI 서비스<br/>(LLM API)"];
+    end
+
+    %% 데이터 흐름 연결
+    A -- 파일 --> D;
+    C -- IPC (JSON-RPC) --> D;
+    D --> E;
+    E -- 실시간 스트림 --> I;
+    F -- 적용 --> E;
+    H -- IPC (JSON-RPC) --> I;
+    L -- HTTPS --> X;
+    X -- JSON 응답 --> M;
+```
+
+---
+
 CuRS의 기능 요구사항(FR)에 대한 시스템 레벨의 구현 명세.
 
 ### SYS-F-01: DLT 로그 처리 시스템 (FR-01, FR-02)
@@ -75,12 +121,13 @@ CuRS의 기능 요구사항(FR)에 대한 시스템 레벨의 구현 명세.
         *   **시퀀스 빌더**: 드래그 앤 드롭 인터페이스를 통해 여러 규칙을 순차적으로 연결하여 'A 발생 후 B 발생'과 같은 시퀀스 규칙을 시각적으로 생성할 수 있게 한다.
     *   **규칙 파일 생성**: 규칙 관리자 UI에서 입력된 내용은 `UIManager`에 의해 검증되고, `RuleEngineModule`이 이해할 수 있는 구조의 YAML 파일로 직렬화(serialize)되어 로컬에 저장된다.
     *   분석 요청 시, 규칙 파일의 내용과 로그 데이터 식별자를 `Core Engine`에 전달.
-    *   **규칙 일괄 관리**: `UIManager`는 다음의 일괄 처리 기능을 제공한다.
+    *   **규칙 파일 및 일괄 관리**: `UIManager`는 다음의 기능을 제공한다.
         *   **가져오기**: 사용자가 Excel 파일을 선택하면, `pandas` 라이브러리를 사용하여 파일을 읽고, 정의된 템플릿에 따라 각 행을 파싱하여 규칙 객체로 변환한 후, 기존 규칙 목록에 추가하거나 덮어쓴다.
         *   **내보내기**: 현재 로드된 규칙 목록(전체 또는 선택)을 단일 JSON 또는 YAML 파일로 직렬화하여 사용자가 지정한 경로에 저장한다.
     *   `Core Engine`의 `RuleEngineModule`은 규칙을 적용하여 필터링/그룹화된 로그의 인덱스 목록을 `UI Application`에 반환.
     *   `UI Application`은 반환된 인덱스 목록을 사용하여 `QTableView`의 표시를 업데이트.
 *   **출력**: 필터링된 로그 뷰, 로컬에 저장된 규칙 파일(YAML).
+*   **데이터 형식**: 규칙 파일은 사람이 읽기 쉬운 YAML을 기본으로 지원하며, 다른 시스템과의 연동을 위해 JSON 형식도 함께 지원한다.
 
 ### SYS-F-03: AI 분석 및 해결책 제시 시스템 (FR-04, FR-05)
 *   **입력**: 사용자의 자연어 질문, 분석 대상 로그 라인 및 컨텍스트 범위.
@@ -131,7 +178,8 @@ CuRS의 기능 요구사항(FR)에 대한 시스템 레벨의 구현 명세.
       "context_id": "CTX1",
       "log_level": "ERROR",
       "payload_type": "string",
-      "payload": "Memory allocation failed."
+      "payload": "Memory allocation failed.",
+      "raw_text": "[2025-09-25 10:30:01.123] [ECU1] [APP1] [CTX1] [ERROR] Memory allocation failed."
     }
     ```
 *   **규칙 파일 모델 (YAML)**: 사용자가 정의하는 필터링 규칙의 데이터 구조.
@@ -139,6 +187,7 @@ CuRS의 기능 요구사항(FR)에 대한 시스템 레벨의 구현 명세.
     rules:
       - name: "Memory Errors"
         enabled: true
+        description: "메모리 할당 관련 에러 로그를 필터링합니다."
         conditions:
           - field: "log_level"
             operator: "equals"
@@ -168,7 +217,9 @@ CuRS의 기능 요구사항(FR)에 대한 시스템 레벨의 구현 명세.
 ## 6. 비기능 요구사항 시스템 명세
 
 *   **NFR-03 (성능)**: `Core Engine`은 C++로 구현하여 I/O 및 파싱 성능을 최적화한다. 대용량 파일 처리를 위해 메모리 맵(mmap) 또는 스트리밍 방식을 사용한다.
+*   **NFR-04 (사용성)**: MVVM(Model-View-ViewModel) 패턴을 적용하여 UI 로직과 비즈니스 로직을 분리한다. 모든 주요 기능에 대해 툴팁과 단축키를 제공한다.
 *   **NFR-05 (보안)**: API 키는 Windows DPAPI(Data Protection API)를 통해 암호화하여 로컬 설정 파일에 저장한다.
+*   **NFR-06 (확장성)**: 플러그인 인터페이스를 명확히 정의하고, 각 플러그인이 독립적으로 동작할 수 있도록 설계한다. `PluginManager`는 플러그인 로드/언로드 및 생명주기를 관리한다.
 *   **NFR-07 (접근성)**: PyQt의 내장 접근성 기능(Accessible Name, Description)을 활용하고, 모든 UI 컨트롤에 대해 키보드 포커스 순서를 명시적으로 정의한다.
-*   **NFR-08 (테스트 용이성)**: `UI Application`의 비즈니스 로직(AI 연동, 세션 관리 등)을 UI 코드와 분리된 클래스로 구현한다. `Core Engine`은 `gtest` 등을 사용하여 단위 테스트를 작성한다.
-*   **NFR-09 (유지보수성)**: C++ 코드는 Google C++ Style Guide, Python 코드는 PEP 8 스타일 가이드를 준수한다.
+*   **NFR-08 (테스트 용이성)**: `UI Application`의 비즈니스 로직(AI 연동, 세션 관리 등)을 UI 코드와 분리된 클래스로 구현하여 단위 테스트가 용이하게 한다. `Core Engine`은 `gtest` 등을 사용하여 단위 테스트를 작성한다.
+*   **NFR-09 (유지보수성)**: C++ 코드는 Google C++ Style Guide, Python 코드는 PEP 8 스타일 가이드를 준수한다. 핵심 모듈과 공개 API에 대해서는 Doxygen/Sphinx를 이용한 문서화를 의무화한다.
